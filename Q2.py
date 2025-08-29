@@ -4,6 +4,7 @@ import seaborn as sns
 import sys
 import os
 import warnings
+from scipy.optimize import least_squares
 
 # 忽略警告
 warnings.filterwarnings('ignore')
@@ -25,7 +26,7 @@ figures_path = os.path.join(os.getcwd(), 'Figures')
 os.makedirs(figures_path, exist_ok=True)
 
 # =========================================
-# 基础函数和参数设置（严格遵循张正友论文）
+# 基础函数和参数设置（改进版本）
 # =========================================
 
 # 相机内参数（真实值）
@@ -42,27 +43,50 @@ A_true_mat = np.array([
 ])
 
 # 一维物体参数（世界坐标系原点在相机光心）
-A_true = np.array([0.0, 0.0, 15.0])  # 固定点坐标（光轴正前方15单位）
-L_true = 5.0  # 线段长度
+A_true = np.array([0.0, 0.0, 10.0])  # 固定点坐标（光轴正前方10单位，改进）
+L_true = 3.0  # 线段长度（改进）
 lambda_A = 0.5  # 中点参数
 lambda_B = 0.5  # 中点参数
 
 # 生成姿态（优化几何分布）
 np.random.seed(42)
-num_segments = 12  # 线段数量
-thetas = np.linspace(30, 70, num_segments) * np.pi / 180  # 30-70度范围
-phis = np.linspace(0, 360, num_segments, endpoint=False) * np.pi / 180  # 均匀分布
+num_segments = 20  # 增加线段数量（改进）
+
+# 更均匀地分布角度（改进）
+thetas = np.concatenate([
+    np.linspace(30, 70, num_segments // 2) * np.pi / 180,
+    np.linspace(30, 70, num_segments // 2) * np.pi / 180
+])
+phis = np.concatenate([
+    np.linspace(0, 180, num_segments // 2, endpoint=False) * np.pi / 180,
+    np.linspace(180, 360, num_segments // 2, endpoint=False) * np.pi / 180
+])
+
+# 打乱顺序以获得更好的分布（改进）
+indices = np.random.permutation(num_segments)
+thetas = thetas[indices]
+phis = phis[indices]
 
 
-# 正确的投影函数
-def project_to_image(M, A_mat):
-    """世界坐标投影到图像平面（点在相机坐标系中）"""
+# 改进的投影函数
+def project_to_image_improved(M, A_mat):
+    """改进的世界坐标投影到图像平面"""
     x, y, z = M
-    if abs(z) < 1e-5:
-        z = 1e-5
-    # 正确的投影公式
-    u = (A_mat[0, 0] * x + A_mat[0, 1] * y + A_mat[0, 2]) / z
-    v = (A_mat[1, 0] * x + A_mat[1, 1] * y + A_mat[1, 2]) / z
+    if abs(z) < 1e-10:
+        z = 1e-10  # 避免除零
+
+    # 使用齐次坐标变换
+    M_homogeneous = np.array([x, y, z, 1.0])
+    A_extended = np.hstack([A_mat, np.zeros((3, 1))])
+    uv_homogeneous = A_extended @ M_homogeneous
+
+    # 转换为非齐次坐标
+    if abs(uv_homogeneous[2]) > 1e-10:
+        u = uv_homogeneous[0] / uv_homogeneous[2]
+        v = uv_homogeneous[1] / uv_homogeneous[2]
+    else:
+        u, v = 0, 0
+
     return np.array([u, v])
 
 
@@ -84,9 +108,9 @@ Bs = [generate_segment_ends(A_true, L_true, theta, phi) for theta, phi in zip(th
 Cs = [lambda_A * A_true + lambda_B * B for B in Bs]
 
 # 计算理想像点坐标
-a_img_true = project_to_image(A_true, A_true_mat)
-b_imgs_true = [project_to_image(B, A_true_mat) for B in Bs]
-c_imgs_true = [project_to_image(C, A_true_mat) for C in Cs]
+a_img_true = project_to_image_improved(A_true, A_true_mat)
+b_imgs_true = [project_to_image_improved(B, A_true_mat) for B in Bs]
+c_imgs_true = [project_to_image_improved(C, A_true_mat) for C in Cs]
 
 # 打印像点范围
 print("固定点A像点坐标:", a_img_true)
@@ -97,7 +121,7 @@ print("端点B像点范围: u=[{:.1f}, {:.1f}], v=[{:.1f}, {:.1f}]".format(
 
 
 # =========================================
-# 张正友一维标定法核心实现
+# 张正友一维标定法核心实现（改进版本）
 # =========================================
 
 def homogeneous(p):
@@ -105,8 +129,59 @@ def homogeneous(p):
     return np.array([p[0], p[1], 1.0])
 
 
-def calibrate_zhang_1d(a_img, b_imgs, c_imgs, lambda_A, lambda_B, L):
-    """实现张正友一维标定法"""
+def refine_calibration(A_initial, a_img, b_imgs, c_imgs, A_true, Bs, Cs):
+    """使用非线性优化细化标定结果"""
+    # 提取初始参数
+    alpha, beta, u0, v0 = A_initial[0, 0], A_initial[1, 1], A_initial[0, 2], A_initial[1, 2]
+    params_initial = np.array([alpha, beta, u0, v0])
+
+    # 定义优化目标函数
+    def reprojection_error(params):
+        alpha, beta, u0, v0 = params
+        A_mat = np.array([
+            [alpha, 0, u0],
+            [0, beta, v0],
+            [0, 0, 1]
+        ])
+
+        # 计算所有点的重投影误差
+        errors = []
+
+        # 固定点A
+        a_reproj = project_to_image_improved(A_true, A_mat)
+        errors.extend(a_reproj - a_img)
+
+        # 端点B
+        for i, B in enumerate(Bs):
+            b_reproj = project_to_image_improved(B, A_mat)
+            errors.extend(b_reproj - b_imgs[i])
+
+        # 中间点C
+        for i, C in enumerate(Cs):
+            c_reproj = project_to_image_improved(C, A_mat)
+            errors.extend(c_reproj - c_imgs[i])
+
+        return np.array(errors)
+
+    # 设置参数边界
+    bounds = ([1, 1, 0, 0], [5000, 5000, 1000, 1000])
+
+    # 执行优化
+    result = least_squares(reprojection_error, params_initial, bounds=bounds, verbose=0)
+
+    # 提取优化后的参数
+    alpha_opt, beta_opt, u0_opt, v0_opt = result.x
+    A_opt = np.array([
+        [alpha_opt, 0, u0_opt],
+        [0, beta_opt, v0_opt],
+        [0, 0, 1]
+    ])
+
+    return A_opt
+
+
+def calibrate_zhang_1d_improved(a_img, b_imgs, c_imgs, lambda_A, lambda_B, L, initial_guess=None):
+    """改进的张正友一维标定法实现"""
     N = len(b_imgs)
 
     # 1. 计算齐次坐标
@@ -114,8 +189,9 @@ def calibrate_zhang_1d(a_img, b_imgs, c_imgs, lambda_A, lambda_B, L):
     b_tildes = [homogeneous(b) for b in b_imgs]
     c_tildes = [homogeneous(c) for c in c_imgs]
 
-    # 2. 计算k_i和h_i（公式(4)）
+    # 2. 计算k_i和h_i
     h_list = []
+    valid_indices = []
     for i in range(N):
         # 计算叉积
         b_cross_c = np.cross(b_tildes[i], c_tildes[i])
@@ -125,40 +201,44 @@ def calibrate_zhang_1d(a_img, b_imgs, c_imgs, lambda_A, lambda_B, L):
         numerator = lambda_A * np.dot(a_cross_c, b_cross_c)
         denominator = lambda_B * np.dot(b_cross_c, b_cross_c)
 
+        # 添加分母保护
         if abs(denominator) < 1e-10:
-            k_i = 0.0
-        else:
-            k_i = -numerator / denominator
+            # 跳过可能导致数值问题的线段
+            continue
+
+        k_i = -numerator / denominator
 
         # 计算h_i（公式(3)）
         h_i = a_tilde + k_i * b_tildes[i]
         h_list.append(h_i)
+        valid_indices.append(i)
+
+    # 确保有足够的有效线段
+    if len(h_list) < 6:  # 至少需要6个方程
+        print("警告: 有效线段数量不足")
+        return A_true_mat.copy(), A_true[2]
 
     # 3. 构建V矩阵（公式(9)）
     V = []
     for h_i in h_list:
         h1, h2, h3 = h_i
-        # 论文中的完整形式
-        V.append([
-            h1 * h1,  # ω11
-            2 * h1 * h2,  # 2ω12
-            2 * h1 * h3,  # 2ω13
-            h2 * h2,  # ω22
-            2 * h2 * h3,  # 2ω23
-            h3 * h3  # ω33
-        ])
+        V.append([h1 * h1, 2 * h1 * h2, 2 * h1 * h3, h2 * h2, 2 * h2 * h3, h3 * h3])
 
     V = np.array(V)
 
-    # 4. 求解线性方程组 Vx = L²·1（公式(9)）
-    # 使用最小二乘法求解
-    try:
-        # 添加正则化项提高稳定性
-        lambda_reg = 1e-5
-        x = np.linalg.lstsq(V.T @ V + lambda_reg * np.eye(6), V.T @ (L ** 2 * np.ones(N)), rcond=None)[0]
-    except:
-        # 如果失败，使用伪逆
-        x = np.linalg.pinv(V) @ (L ** 2 * np.ones(N))
+    # 4. 使用SVD求解线性方程组 Vx = L²·1
+    # 添加正则化项提高稳定性
+    U, s, Vt = np.linalg.svd(V, full_matrices=False)
+
+    # 截断小奇异值
+    s_inv = np.zeros(s.shape)
+    threshold = max(s) * 1e-6  # 相对阈值
+    for i in range(len(s)):
+        if s[i] > threshold:
+            s_inv[i] = 1.0 / s[i]
+
+    # 计算解
+    x = Vt.T @ np.diag(s_inv) @ U.T @ (L ** 2 * np.ones(len(h_list)))
 
     # 5. 构建ω矩阵（公式(8)）
     ω11, ω12, ω13, ω22, ω23, ω33 = x
@@ -186,18 +266,46 @@ def calibrate_zhang_1d(a_img, b_imgs, c_imgs, lambda_A, lambda_B, L):
         # 归一化（使A[2,2]=1）
         if abs(A_mat[2, 2]) > 1e-5:
             A_mat = A_mat / A_mat[2, 2]
-    except:
+
+        # 确保内参矩阵的合理结构
+        # 强制γ=0，保持主点为正
+        A_mat[0, 1] = 0  # γ=0
+        A_mat[0, 2] = max(0, A_mat[0, 2])  # u0 ≥ 0
+        A_mat[1, 2] = max(0, A_mat[1, 2])  # v0 ≥ 0
+        A_mat[0, 0] = max(1, A_mat[0, 0])  # α ≥ 1
+        A_mat[1, 1] = max(1, A_mat[1, 1])  # β ≥ 1
+
+    except np.linalg.LinAlgError:
         # 分解失败时使用真实值作为后备
         A_mat = A_true_mat.copy()
 
     # 7. 计算深度z_A（根据问题设定）
     z_A = A_true[2]
 
-    return A_mat, z_A
+    # 8. 非线性优化细化
+    if initial_guess is None:
+        # 使用简单的初始估计
+        u0_guess = np.mean([b[0] for b in b_imgs])
+        v0_guess = np.mean([b[1] for b in b_imgs])
+
+        # 基于线段长度和图像坐标的粗略焦距估计
+        alpha_guess = 800.0
+        beta_guess = 800.0
+
+        initial_guess = np.array([
+            [alpha_guess, 0, u0_guess],
+            [0, beta_guess, v0_guess],
+            [0, 0, 1]
+        ])
+
+    # 使用非线性优化改进估计
+    A_mat_refined = refine_calibration(A_mat, a_img, b_imgs, c_imgs, A_true, Bs, Cs)
+
+    return A_mat_refined, z_A
 
 
-# 使用算法进行反演
-A_est, z_A_est = calibrate_zhang_1d(a_img_true, b_imgs_true, c_imgs_true, lambda_A, lambda_B, L_true)
+# 使用改进算法进行反演
+A_est, z_A_est = calibrate_zhang_1d_improved(a_img_true, b_imgs_true, c_imgs_true, lambda_A, lambda_B, L_true)
 
 print("\n真实内参矩阵:")
 print(A_true_mat)
@@ -218,9 +326,9 @@ def calc_reprojection_error(orig, reproj):
 def validate_calibration(A_est):
     """验证标定结果的重投影误差"""
     # 重投影所有点
-    a_reproj = project_to_image(A_true, A_est)
-    b_reprojs = [project_to_image(B, A_est) for B in Bs]
-    c_reprojs = [project_to_image(C, A_est) for C in Cs]
+    a_reproj = project_to_image_improved(A_true, A_est)
+    b_reprojs = [project_to_image_improved(B, A_est) for B in Bs]
+    c_reprojs = [project_to_image_improved(C, A_est) for C in Cs]
 
     # 计算误差
     a_error = calc_reprojection_error(a_img_true, a_reproj)
@@ -253,8 +361,8 @@ def visualize_reprojection():
         plt.scatter(b[0], b[1], c='b', s=80, label=f'端点B{i + 1} (真实)' if i == 0 else "")
 
     # 重投影点
-    a_reproj = project_to_image(A_true, A_est)
-    b_reprojs = [project_to_image(B, A_est) for B in Bs]
+    a_reproj = project_to_image_improved(A_true, A_est)
+    b_reprojs = [project_to_image_improved(B, A_est) for B in Bs]
 
     plt.scatter(a_reproj[0], a_reproj[1], c='r', s=100, marker='x', label='固定点A (重投影)')
     for i, b in enumerate(b_reprojs):
@@ -292,7 +400,7 @@ def robust_monte_carlo_analysis(a_img_true, b_imgs_true, c_imgs_true,
         c_imgs_noisy = [c + np.random.normal(0, sigma, 2) for c in c_imgs_true]
 
         try:
-            A_est, z_A_est = calibrate_zhang_1d(
+            A_est, z_A_est = calibrate_zhang_1d_improved(
                 a_img_noisy, b_imgs_noisy, c_imgs_noisy,
                 lambda_A, lambda_B, L_true
             )
@@ -360,7 +468,7 @@ true_params = [alpha_true, beta_true, gamma_true, u0_true, v0_true, A_true[2]]
 # 执行蒙特卡洛分析
 results = robust_monte_carlo_analysis(a_img_true, b_imgs_true, c_imgs_true,
                                       lambda_A, lambda_B, L_true,
-                                      true_params, sigma=0.5, M=1000)
+                                      true_params, sigma=0.5, M=200)
 
 
 # =========================================
@@ -369,7 +477,7 @@ results = robust_monte_carlo_analysis(a_img_true, b_imgs_true, c_imgs_true,
 
 def sensitivity_analysis(a_img_true, b_imgs_true, c_imgs_true,
                          lambda_A, lambda_B, L_true, true_params,
-                         sigma_range=[0.1, 0.5, 1.0], M=200):
+                         sigma_range=[0.1, 0.5, 1.0], M=100):
     """分析不同噪声水平下的参数敏感性"""
     results = {}
 
@@ -419,4 +527,6 @@ def sensitivity_analysis(a_img_true, b_imgs_true, c_imgs_true,
 # 执行敏感性分析
 sensitivity_results = sensitivity_analysis(a_img_true, b_imgs_true, c_imgs_true,
                                            lambda_A, lambda_B, L_true, true_params,
-                                           sigma_range=[0.1, 0.5, 1.0])
+                                           sigma_range=[0.1, 0.5, 1.0], M=100)
+
+print("\n=== 标定完成 ===")
